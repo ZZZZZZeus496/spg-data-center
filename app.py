@@ -821,7 +821,10 @@ def main():
 
         # ─── API 引擎（从 Streamlit Secrets 读取密钥） ───
         engine_id = "qwen"
-        api_key = st.secrets.get("DASHSCOPE_API_KEY", "")
+        try:
+            api_key = st.secrets["DASHSCOPE_API_KEY"]
+        except (KeyError, FileNotFoundError):
+            api_key = ""
         if not api_key:
             st.error("⚠️ 未配置 DASHSCOPE_API_KEY，请在 Streamlit Cloud 的 Secrets 或本地 .streamlit/secrets.toml 中设置。")
             st.stop()
@@ -1183,5 +1186,4 @@ def show_report(df: pd.DataFrame):
 
 
 # ══════════════════════════════════════════════
-if __name__ == "__main__":
-    main()
+main()
