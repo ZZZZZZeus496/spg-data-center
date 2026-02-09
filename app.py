@@ -655,16 +655,16 @@ def build_matcher_text(text: str):
 
 
 def match_id(gid: str, id2n: dict, ids: list, thr: int = 60) -> str:
-    """将游戏ID模糊匹配为战队成员真名。匹配不到则返回空字符串。"""
+    """将游戏ID模糊匹配为战队成员真名。匹配不到则返回原始游戏ID。"""
     if not gid or not gid.strip():
         return ""
     gid = gid.strip()
     if gid in id2n:
         return id2n[gid]
     if not ids:
-        return ""
+        return gid
     r = process.extractOne(gid, ids, scorer=fuzz.token_set_ratio, score_cutoff=thr)
-    return id2n[r[0]] if r else ""
+    return id2n[r[0]] if r else gid
 
 
 # ══════════════════════════════════════════════
