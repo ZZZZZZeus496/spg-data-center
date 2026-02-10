@@ -32,6 +32,7 @@ images/
 *.avi
 *.mov
 temp_frames/
+temp_roster_frames/
 
 # 旧版脚本（非部署文件）
 main.py
