@@ -1486,4 +1486,11 @@ def show_report(df: pd.DataFrame):
 
 
 # ══════════════════════════════════════════════
-main()
+if __name__ == "__main__" or True:
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        st.error("❌ 应用启动失败")
+        st.code(traceback.format_exc(), language="text")
+        st.info("请将上述错误信息反馈给开发者，或检查 Streamlit Cloud 的 Logs。")
