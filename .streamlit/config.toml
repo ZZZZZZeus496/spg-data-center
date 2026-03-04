@@ -1,0 +1,11 @@
+# Streamlit 配置 - 优化手机端体验
+[server]
+# 限制单次上传总大小，避免手机端上传过大文件过慢（MB）
+maxUploadSize = 30
+# 启用 CORS
+enableCORS = true
+enableXsrfProtection = true
+
+[browser]
+# 手机端使用更紧凑的 UI
+gatherUsageStats = false

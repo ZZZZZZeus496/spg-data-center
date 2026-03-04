@@ -500,6 +500,32 @@ def frame_to_png_bytes(frame: np.ndarray) -> bytes:
     return buf.tobytes() if ok else b""
 
 
+# 手机端优化：压缩图片以减少上传/传输时间，加快分析
+MAX_IMG_WIDTH = 1280
+JPEG_QUALITY = 85
+
+
+def _compress_image_for_api(img_bytes: bytes, mime: str) -> tuple[bytes, str]:
+    """压缩图片至合理尺寸，减少 API 传输与处理时间。"""
+    try:
+        arr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return img_bytes, mime
+        h, w = img.shape[:2]
+        if w <= MAX_IMG_WIDTH:
+            return img_bytes, mime
+        scale = MAX_IMG_WIDTH / w
+        new_w, new_h = MAX_IMG_WIDTH, int(h * scale)
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        if ok:
+            return buf.tobytes(), "image/jpeg"
+    except Exception:
+        pass
+    return img_bytes, mime
+
+
 # ══════════════════════════════════════════════
 # GPT-4o-mini Vision API
 # ══════════════════════════════════════════════
@@ -1044,6 +1070,7 @@ def main():
     """, unsafe_allow_html=True)
 
     # ──────── 上传区域 ────────
+    st.caption("💡 手机端建议：使用截屏或压缩后上传（单张建议 <2MB），速度更快")
     uploaded = st.file_uploader(
         "拖拽截图或录屏到此处",
         type=["jpg", "jpeg", "png", "webp", "mp4", "mov", "avi"],
@@ -1101,17 +1128,30 @@ def main():
             else:
                 st.warning(f"⚠️ 未在 {vf.name} 中检测到结算画面，请确认视频内容")
 
-    # ── 图片预览 ──
+    # ── 图片预览（缩略图，减轻手机端渲染） ──
     if imgs:
         st.markdown("---")
         st.markdown(f"**🖼️ 已上传 {len(imgs)} 张截图**")
-        n_show = min(len(imgs), 6)
+        n_show = min(len(imgs), 4)
         cols = st.columns(n_show)
         for i in range(n_show):
             with cols[i]:
-                st.image(imgs[i], caption=imgs[i].name, use_container_width=True)
-        if len(imgs) > 6:
-            st.caption(f"... 还有 {len(imgs) - 6} 张")
+                try:
+                    b = imgs[i].getvalue()
+                    arr = np.frombuffer(b, np.uint8)
+                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if img is not None and img.shape[1] > 400:
+                        h, w = img.shape[:2]
+                        scale = 400 / w
+                        thumb = cv2.resize(img, (400, int(h * scale)), interpolation=cv2.INTER_AREA)
+                        thumb_rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
+                        st.image(thumb_rgb, caption=imgs[i].name, use_container_width=True)
+                    else:
+                        st.image(imgs[i], caption=imgs[i].name, use_container_width=True)
+                except Exception:
+                    st.image(imgs[i], caption=imgs[i].name, use_container_width=True)
+        if len(imgs) > 4:
+            st.caption(f"... 还有 {len(imgs) - 4} 张")
 
     # ── 开始分析 ──
     total_count = len(imgs) + len(auto_frames)
@@ -1163,6 +1203,7 @@ def do_analysis(imgs, auto_frames, api_key, id2n, all_ids, thr, engine="qwen"):
     def _analyze_one(idx, bts, mime, name):
         """单张图片分析（在子线程中执行）"""
         try:
+            bts, mime = _compress_image_for_api(bts, mime)
             res = call_vision(bts, mime, api_key, engine=engine)
             row = result_to_row(res, id2n, all_ids, thr, name)
             if row:
