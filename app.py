@@ -503,6 +503,7 @@ def frame_to_png_bytes(frame: np.ndarray) -> bytes:
 # 手机端优化：压缩图片以减少上传/传输时间，加快分析
 MAX_IMG_WIDTH = 1280
 JPEG_QUALITY = 85
+MAX_DIRECT_BYTES = 1_500_000  # 约 1.5MB，超过则尝试再压缩
 
 
 def _compress_image_for_api(img_bytes: bytes, mime: str) -> tuple[bytes, str]:
@@ -513,11 +514,16 @@ def _compress_image_for_api(img_bytes: bytes, mime: str) -> tuple[bytes, str]:
         if img is None:
             return img_bytes, mime
         h, w = img.shape[:2]
-        if w <= MAX_IMG_WIDTH:
+        resized = img
+        if w > MAX_IMG_WIDTH:
+            scale = MAX_IMG_WIDTH / w
+            new_w, new_h = MAX_IMG_WIDTH, int(h * scale)
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        # 即使宽度不大，但体积过大时也转 jpg 压缩一次
+        if w <= MAX_IMG_WIDTH and len(img_bytes) <= MAX_DIRECT_BYTES:
             return img_bytes, mime
-        scale = MAX_IMG_WIDTH / w
-        new_w, new_h = MAX_IMG_WIDTH, int(h * scale)
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
         ok, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if ok:
             return buf.tobytes(), "image/jpeg"
@@ -820,6 +826,30 @@ def _count_roster_matches(players: list, id2n: dict, ids: list, thr: int) -> int
     return count
 
 
+def _pick_our_side(left: dict, right: dict, id2n: dict, ids: list, thr: int, top_result: str) -> dict:
+    """根据名单匹配优先，平票时用顶部胜负做二级判定。"""
+    left_players = left.get("选手") or []
+    right_players = right.get("选手") or []
+    left_cnt = _count_roster_matches(left_players, id2n, ids, thr)
+    right_cnt = _count_roster_matches(right_players, id2n, ids, thr)
+    if left_cnt > right_cnt:
+        return left
+    if right_cnt > left_cnt:
+        return right
+
+    # 平票：优先选择比赛结果与顶部大字一致的一侧
+    if top_result in ("胜利", "失败"):
+        left_res = str(left.get("比赛结果") or "").strip()
+        right_res = str(right.get("比赛结果") or "").strip()
+        if left_res == top_result and right_res != top_result:
+            return left
+        if right_res == top_result and left_res != top_result:
+            return right
+
+    # 仍无法区分时兜底左侧
+    return left
+
+
 def result_to_row(res: dict, id2n: dict, ids: list, thr: int, src: str) -> dict | None:
     """将 API 返回结果转换为表格行。根据队员名单匹配确定我方，不依赖胜利/失败。"""
     if res.get("error"):
@@ -830,15 +860,8 @@ def result_to_row(res: dict, id2n: dict, ids: list, thr: int, src: str) -> dict 
     right = res.get("右侧队伍") or {}
 
     if left and right:
-        left_players = left.get("选手") or []
-        right_players = right.get("选手") or []
-        left_cnt = _count_roster_matches(left_players, id2n, ids, thr)
-        right_cnt = _count_roster_matches(right_players, id2n, ids, thr)
-        # 匹配数多的一侧为我方；若相等则取左侧（或可改为取胜利方，但用户要求不依赖胜负）
-        if right_cnt > left_cnt:
-            side = right
-        else:
-            side = left
+        top_result = str(res.get("顶部显示") or "").strip()
+        side = _pick_our_side(left, right, id2n, ids, thr, top_result)
         players = side.get("选手") or []
         camp = side.get("阵营") or "未知"
         # 顶部显示的胜利/失败为最终权威，优先使用
@@ -874,6 +897,7 @@ def result_to_row(res: dict, id2n: dict, ids: list, thr: int, src: str) -> dict 
             "胜负情况": result,
             "MVP": f"{mvp_name} {mvp_score}".strip() if mvp_name else "",
             "备注": "",
+            "_对抗路奖牌": "", "_中路奖牌": "", "_发育路奖牌": "", "_打野奖牌": "", "_游走奖牌": "",
         }
 
     # 新格式：含分路/评分/奖牌的选手列表
@@ -932,6 +956,8 @@ def result_to_row(res: dict, id2n: dict, ids: list, thr: int, src: str) -> dict 
         lane_map.get(l, {}).get("name", ""): lane_map.get(l, {}).get("medal", "")
         for l in LANE_ORDER if lane_map.get(l, {}).get("name", "")
     }
+    for l in LANE_ORDER:
+        row[f"_{l}奖牌"] = lane_map.get(l, {}).get("medal", "")
     return row
 
 
@@ -1289,6 +1315,17 @@ def show_report(df: pd.DataFrame):
     # ── 只展示腾讯文档格式列 ──
     display_cols = st.session_state.get("display_cols", [c for c in df.columns if not c.startswith("_")])
     show_df = df[display_cols].copy()
+    lane_cols = ["对抗路选手", "中路选手", "发育路选手", "打野选手", "游走选手"]
+    # 把奖牌标记追加到对应分路单元格，方便每把核对
+    for lane_col in lane_cols:
+        medal_col = f"_{lane_col.replace('选手', '奖牌')}"
+        if lane_col in show_df.columns and medal_col in df.columns:
+            merged = []
+            for idx, name in show_df[lane_col].items():
+                n = str(name).strip() if name else ""
+                m = str(df.at[idx, medal_col]).strip() if idx in df.index else ""
+                merged.append(f"{n} [{m}]" if n and m else n)
+            show_df[lane_col] = merged
 
     # ── 表格样式 ──
     def style_result(val):
@@ -1316,12 +1353,27 @@ def show_report(df: pd.DataFrame):
             return "background-color: rgba(205,127,50,0.15)"
         return ""
 
+    def style_lane_medal_cell(val):
+        s = str(val) if val else ""
+        if "[顶级]" in s:
+            return "background-color: rgba(255,215,0,0.34); color:#7a5200; font-weight:900"
+        if "[金牌]" in s:
+            return "background-color: rgba(255,215,0,0.22); color:#7a5200; font-weight:700"
+        if "[银牌]" in s:
+            return "background-color: rgba(192,192,192,0.26); color:#4a4a4a; font-weight:700"
+        if "[铜牌]" in s:
+            return "background-color: rgba(205,127,50,0.22); color:#6a3b15; font-weight:700"
+        return ""
+
     styled = show_df.style
 
     if result_col in show_df.columns:
         styled = styled.map(style_result, subset=[result_col])
     if "MVP" in show_df.columns:
         styled = styled.map(style_mvp_col, subset=["MVP"])
+    lane_subset = [c for c in lane_cols if c in show_df.columns]
+    if lane_subset:
+        styled = styled.map(style_lane_medal_cell, subset=lane_subset)
     if "备注" in show_df.columns:
         styled = styled.map(style_medal_col, subset=["备注"])
 
@@ -1434,6 +1486,38 @@ def show_report(df: pd.DataFrame):
 
             st.caption("排名规则：MVP 次数相同时，按评分总和排序。第1名为周 MVP 状元，第2名为榜眼，第3名为探花。")
 
+    # ── 奖牌统计：用于更精准参考每周 MVP 归属 ──
+    medal_lane_cols = [f"_{l}奖牌" for l in LANE_ORDER if f"_{l}奖牌" in df.columns]
+    if medal_lane_cols:
+        st.markdown("")
+        st.markdown("### 🎖️ 周奖牌统计（顶级/金牌/银牌/铜牌）")
+        player_medal_counter = {}
+        for _, row in df.iterrows():
+            for l in LANE_ORDER:
+                name_col = f"{l}选手"
+                medal_col = f"_{l}奖牌"
+                if name_col not in df.columns or medal_col not in df.columns:
+                    continue
+                n = str(row.get(name_col, "")).strip()
+                m = str(row.get(medal_col, "")).strip()
+                if not n or m not in ("顶级", "金牌", "银牌", "铜牌"):
+                    continue
+                if n not in player_medal_counter:
+                    player_medal_counter[n] = {"顶级": 0, "金牌": 0, "银牌": 0, "铜牌": 0}
+                player_medal_counter[n][m] += 1
+
+        if player_medal_counter:
+            medal_df = (
+                pd.DataFrame.from_dict(player_medal_counter, orient="index")
+                .reset_index()
+                .rename(columns={"index": "选手"})
+            )
+            medal_df["总奖牌"] = medal_df[["顶级", "金牌", "银牌", "铜牌"]].sum(axis=1)
+            medal_df = medal_df.sort_values(["顶级", "金牌", "银牌", "铜牌", "总奖牌"], ascending=False).reset_index(drop=True)
+            medal_df.index = range(1, len(medal_df) + 1)
+            medal_df.index.name = "排名"
+            st.dataframe(medal_df, use_container_width=True)
+
     # ── 下载 ──
     st.markdown("---")
     st.markdown("### 📥 导出报表")
@@ -1460,6 +1544,10 @@ def show_report(df: pd.DataFrame):
     st.markdown("")
     if st.button("📤 推送 members.json 到 GitHub", type="secondary", use_container_width=True):
         try:
+            if os.environ.get("STREAMLIT_RUNTIME_ENVIRONMENT") == "cloud":
+                st.warning("Cloud 环境不建议直接执行 git push，请在本地仓库提交后推送。")
+                st.info("建议流程：本地 `git add members.json && git commit && git push`")
+                return
             root = Path(__file__).resolve().parent
             subprocess.run(["git", "add", "members.json"], cwd=root, capture_output=True, text=True, timeout=10)
             r2 = subprocess.run(
@@ -1486,7 +1574,7 @@ def show_report(df: pd.DataFrame):
 
 
 # ══════════════════════════════════════════════
-if __name__ == "__main__" or True:
+if __name__ == "__main__":
     try:
         main()
     except Exception as e:
