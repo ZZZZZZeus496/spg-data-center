@@ -17,6 +17,8 @@ import random
 import re
 import subprocess
 import tempfile
+import uuid
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
@@ -1134,6 +1136,99 @@ def df_to_excel(df: pd.DataFrame) -> bytes:
     return buf.getvalue()
 
 
+def _store_file(kind: str) -> Path:
+    base = Path(".spg_store")
+    base.mkdir(parents=True, exist_ok=True)
+    return base / f"{kind}.json"
+
+
+def _load_store(kind: str) -> list[dict]:
+    p = _store_file(kind)
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_store(kind: str, records: list[dict]) -> None:
+    p = _store_file(kind)
+    p.write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _json_safe(v):
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    try:
+        return v.item()  # numpy 标量
+    except Exception:
+        pass
+    if isinstance(v, (list, dict)):
+        return v
+    return str(v)
+
+
+def _build_record_from_row(row: dict, source: str) -> dict:
+    clean = {k: _json_safe(v) for k, v in row.items()}
+    fp_src = {
+        k: clean.get(k, "")
+        for k in ["日期", "对抗路选手", "中路选手", "发育路选手", "打野选手", "游走选手", "MVP"]
+    }
+    fp = hashlib.sha1(json.dumps(fp_src, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    clean["_record_id"] = str(uuid.uuid4())
+    clean["_fingerprint"] = fp
+    clean["_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    clean["_source"] = source
+    return clean
+
+
+def append_df_to_store(df: pd.DataFrame, kind: str, source: str) -> int:
+    if df is None or df.empty:
+        return 0
+    records = _load_store(kind)
+    existing_fp = {str(r.get("_fingerprint", "")) for r in records}
+    added = 0
+    for _, row in df.iterrows():
+        rec = _build_record_from_row(row.to_dict(), source=source)
+        if rec["_fingerprint"] in existing_fp:
+            continue
+        records.append(rec)
+        existing_fp.add(rec["_fingerprint"])
+        added += 1
+    _save_store(kind, records)
+    return added
+
+
+def pop_all_pending_to_confirmed() -> int:
+    pending = _load_store("pending")
+    if not pending:
+        return 0
+    confirmed = _load_store("confirmed")
+    existing_fp = {str(r.get("_fingerprint", "")) for r in confirmed}
+    moved = 0
+    for r in pending:
+        fp = str(r.get("_fingerprint", ""))
+        if fp in existing_fp:
+            continue
+        r["_confirmed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        confirmed.append(r)
+        existing_fp.add(fp)
+        moved += 1
+    _save_store("confirmed", confirmed)
+    _save_store("pending", [])
+    return moved
+
+
+def clear_store(kind: str) -> None:
+    _save_store(kind, [])
+
+
+def display_columns_for(df: pd.DataFrame) -> list[str]:
+    preferred = ["日期", "对抗路选手", "打野选手", "中路选手", "发育路选手", "游走选手", "胜负情况", "MVP", "本方阵营"]
+    return [c for c in preferred if c in df.columns]
+
+
 def default_member_text() -> str:
     p = Path("members.json")
     if p.exists():
@@ -1391,8 +1486,72 @@ def main():
     if go or re_go:
         do_analysis(img_items, auto_frames, api_key, id2n, all_ids, threshold, engine_id)
 
-    if "result_df" in st.session_state and st.session_state.result_df is not None:
-        show_report(st.session_state.result_df)
+    current_df = st.session_state.get("result_df")
+    pending_df = pd.DataFrame(_load_store("pending"))
+    confirmed_df = pd.DataFrame(_load_store("confirmed"))
+
+    st.markdown("---")
+    tab_current, tab_pending, tab_confirmed = st.tabs(["🧪 本次分析（待确认）", "📝 待确认区", "📚 已确认台账"])
+
+    with tab_current:
+        if current_df is None or current_df.empty:
+            st.info("当前没有新的分析结果。上传素材并分析后，可在这里确认保存。")
+        else:
+            st.info("当前结果尚未进入长期台账。请确认无误后再保存，避免错误数据污染历史记录。")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                save_pending_btn = st.button("💾 保存到待确认区", use_container_width=True)
+            with c2:
+                save_confirmed_btn = st.button("✅ 直接确认写入台账", type="primary", use_container_width=True)
+            with c3:
+                discard_current_btn = st.button("🗑️ 丢弃本次结果", use_container_width=True)
+
+            if save_pending_btn:
+                added = append_df_to_store(current_df, kind="pending", source="current-analysis")
+                st.success(f"已加入待确认区：{added} 条（自动去重）")
+                st.rerun()
+            if save_confirmed_btn:
+                added = append_df_to_store(current_df, kind="confirmed", source="current-analysis")
+                st.success(f"已写入已确认台账：{added} 条（自动去重）")
+                st.session_state.result_df = None
+                st.rerun()
+            if discard_current_btn:
+                st.session_state.result_df = None
+                st.warning("已丢弃本次分析结果。")
+                st.rerun()
+
+            st.session_state.display_cols = display_columns_for(current_df)
+            show_report(current_df)
+
+    with tab_pending:
+        if pending_df.empty:
+            st.info("待确认区为空。")
+        else:
+            st.caption(f"待确认区共有 {len(pending_df)} 条记录。")
+            p1, p2 = st.columns(2)
+            with p1:
+                confirm_all_btn = st.button("✅ 全部确认写入台账", type="primary", use_container_width=True)
+            with p2:
+                clear_pending_btn = st.button("🧹 清空待确认区", use_container_width=True)
+
+            if confirm_all_btn:
+                moved = pop_all_pending_to_confirmed()
+                st.success(f"已从待确认区写入台账：{moved} 条（自动去重）")
+                st.rerun()
+            if clear_pending_btn:
+                clear_store("pending")
+                st.warning("待确认区已清空。")
+                st.rerun()
+
+            st.dataframe(pending_df[display_columns_for(pending_df)], use_container_width=True, hide_index=True)
+
+    with tab_confirmed:
+        if confirmed_df.empty:
+            st.info("已确认台账为空。")
+        else:
+            st.caption(f"已确认台账共 {len(confirmed_df)} 条记录（仅此处作为长期统计与导出依据）。")
+            st.session_state.display_cols = display_columns_for(confirmed_df)
+            show_report(confirmed_df)
 
 
 # ══════════════════════════════════════════════
