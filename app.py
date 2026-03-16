@@ -796,6 +796,8 @@ def _is_hero_name(name: str) -> bool:
 
 # 尾随/首尾符号（OCR/识别可能产生变体的符号，统一去除后再匹配）
 _NORM_SYMBOLS = frozenset("♡♥♂♀★☆♦♣♠°·˚^~`｀〃々〆〇〓〤〥〦〧〨〩〪〭〮〯〫〬")
+_LANE_WORDS = ("对抗路", "中路", "发育路", "打野", "游走", "辅助", "边路", "上路", "下路", "野区")
+_MEDAL_WORDS = ("顶级", "金牌", "银牌", "铜牌", "金鹰")
 
 
 def _normalize_for_match(s: str) -> str:
@@ -825,10 +827,37 @@ def _clean_gid_candidate(s: str) -> str:
     if "：" in s or ":" in s:
         left, right = re.split(r"[：:]", s, maxsplit=1)
         left = left.strip()
-        if any(k in left for k in ("对抗路", "中路", "发育路", "打野", "游走", "辅助", "MVP", "顶级", "金牌", "银牌", "铜牌", "金鹰")):
+        if any(k in left for k in (*_LANE_WORDS, "MVP", *_MEDAL_WORDS)):
             s = right.strip()
 
     return s.strip()
+
+
+def _is_lane_medal_noise_text(s: str) -> bool:
+    """
+    判定“金牌发育路 / 银牌打野 / 顶级游走”等明显非人名的噪声文本。
+    """
+    s = str(s or "").strip()
+    if not s:
+        return True
+
+    # 去掉常见包裹符号与空白后再判断
+    compact = re.sub(r"[\s\[\]【】()（）:：\-_/]+", "", s)
+    if not compact:
+        return True
+
+    has_lane = any(w in compact for w in _LANE_WORDS)
+    has_medal = any(w in compact for w in _MEDAL_WORDS)
+
+    # 奖牌+分路的组合基本可判定为噪声，不应作为人名
+    if has_lane and has_medal:
+        return True
+
+    # 仅分路词（无其他信息）同样不是人名
+    if has_lane and len(compact) <= 4:
+        return True
+
+    return False
 
 
 def match_id(gid: str, id2n: dict, ids: list, thr: int = 60) -> str:
@@ -841,6 +870,8 @@ def match_id(gid: str, id2n: dict, ids: list, thr: int = 60) -> str:
     gid = _clean_gid_candidate(gid)
     if not gid:
         return ""
+    if _is_lane_medal_noise_text(gid):
+        return ""
     if _is_hero_name(gid):
         return ""
     # 1. 精确匹配
@@ -848,6 +879,8 @@ def match_id(gid: str, id2n: dict, ids: list, thr: int = 60) -> str:
         return id2n[gid]
     # 2. 规范化后精确匹配：去首尾符号后与选手表中的 ID 一致则视为同一人
     gid_norm = _normalize_for_match(gid)
+    if _is_lane_medal_noise_text(gid_norm):
+        return ""
     if gid_norm:
         for known_id, real_name in id2n.items():
             if _normalize_for_match(known_id) == gid_norm:
