@@ -1075,7 +1075,13 @@ def df_to_excel(df: pd.DataFrame) -> bytes:
 
         # 视觉风格：接近腾讯文档记录表
         header_fill = PatternFill("solid", fgColor="F3F5F8")
-        lane_fill = PatternFill("solid", fgColor="FFF4CC")
+        mvp_fill = PatternFill("solid", fgColor="FFF4CC")
+        medal_fills = {
+            "顶级": PatternFill("solid", fgColor="FFE08A"),
+            "金牌": PatternFill("solid", fgColor="FFF2B2"),
+            "银牌": PatternFill("solid", fgColor="E9EDF3"),
+            "铜牌": PatternFill("solid", fgColor="F4DFD0"),
+        }
         win_fill = PatternFill("solid", fgColor="4CAF50")
         lose_fill = PatternFill("solid", fgColor="E57373")
         thin_border = Border(
@@ -1092,7 +1098,7 @@ def df_to_excel(df: pd.DataFrame) -> bytes:
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = thin_border
 
-        lane_like_cols = {"对抗路选手", "打野选手", "中路选手", "发育路选手", "游走选手", "MVP"}
+        lane_cols = {"对抗路选手", "打野选手", "中路选手", "发育路选手", "游走选手"}
         result_col = "胜负情况" if "胜负情况" in df.columns else "比赛结果"
 
         # 数据行样式
@@ -1101,11 +1107,19 @@ def df_to_excel(df: pd.DataFrame) -> bytes:
                 cell = ws.cell(ri, ci)
                 cell.alignment = Alignment(horizontal="center", vertical="center")
                 cell.border = thin_border
+                v = str(cell.value or "").strip()
 
-                if col in lane_like_cols:
-                    cell.fill = lane_fill
+                # 分路格：按「顶级/金牌/银牌/铜牌」单格染色，并保留奖牌文字便于周MVP归属复盘
+                if col in lane_cols:
+                    for medal, fill in medal_fills.items():
+                        if f"【{medal}】" in v or f"[{medal}]" in v:
+                            cell.fill = fill
+                            cell.font = Font(color="3A3A3A", bold=True)
+                            break
+                elif col == "MVP":
+                    cell.fill = mvp_fill
+
                 if col == result_col:
-                    v = str(cell.value or "").strip()
                     if v == "胜利":
                         cell.fill = win_fill
                         cell.font = Font(color="FFFFFF", bold=True)
@@ -1523,7 +1537,7 @@ def show_report(df: pd.DataFrame):
             for idx, name in show_df[lane_col].items():
                 n = str(name).strip() if name else ""
                 m = str(df.at[idx, medal_col]).strip() if idx in df.index else ""
-                merged.append(f"{n} [{m}]" if n and m else n)
+                merged.append(f"{n}【{m}】" if n and m else n)
             show_df[lane_col] = merged
 
     # ── 表格样式 ──
@@ -1554,14 +1568,14 @@ def show_report(df: pd.DataFrame):
 
     def style_lane_medal_cell(val):
         s = str(val) if val else ""
-        if "[顶级]" in s:
-            return "background-color: rgba(255,215,0,0.34); color:#7a5200; font-weight:900"
-        if "[金牌]" in s:
-            return "background-color: rgba(255,215,0,0.22); color:#7a5200; font-weight:700"
-        if "[银牌]" in s:
-            return "background-color: rgba(192,192,192,0.26); color:#4a4a4a; font-weight:700"
-        if "[铜牌]" in s:
-            return "background-color: rgba(205,127,50,0.22); color:#6a3b15; font-weight:700"
+        if "【顶级】" in s or "[顶级]" in s:
+            return "background-color: #ffe08a; color:#7a5200; font-weight:900"
+        if "【金牌】" in s or "[金牌]" in s:
+            return "background-color: #fff2b2; color:#7a5200; font-weight:700"
+        if "【银牌】" in s or "[银牌]" in s:
+            return "background-color: #e9edf3; color:#4a4a4a; font-weight:700"
+        if "【铜牌】" in s or "[铜牌]" in s:
+            return "background-color: #f4dfd0; color:#6a3b15; font-weight:700"
         return ""
 
     def style_podium_row(row):
@@ -1586,9 +1600,8 @@ def show_report(df: pd.DataFrame):
     if "备注" in show_df.columns:
         styled = styled.map(style_medal_col, subset=["备注"])
 
-    lane_like_cols = [c for c in ["对抗路选手", "打野选手", "中路选手", "发育路选手", "游走选手", "MVP"] if c in show_df.columns]
-    if lane_like_cols:
-        styled = styled.set_properties(subset=lane_like_cols, **{"background-color": "#fff4cc"})
+    if "MVP" in show_df.columns:
+        styled = styled.set_properties(subset=["MVP"], **{"background-color": "#fff4cc"})
 
     styled = (
         styled
@@ -1726,7 +1739,8 @@ def show_report(df: pd.DataFrame):
     st.markdown("### 📥 导出报表")
 
     # 导出时只包含腾讯文档列
-    export_df = df[display_cols].copy()
+    # 导出内容与网页同步：保留每一把分路中的奖牌标识，便于精确复盘周MVP归属
+    export_df = show_df.copy()
 
     _, dl_col, _ = st.columns([1, 2, 1])
     with dl_col:
