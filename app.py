@@ -1485,7 +1485,7 @@ def do_analysis(imgs, auto_frames, api_key, id2n, all_ids, thr, engine="qwen"):
         df = pd.DataFrame(rows)
         # 显示列（贴近你提供的记录表顺序）
         display_cols = ["日期", "对抗路选手", "打野选手", "中路选手", "发育路选手",
-                        "游走选手", "胜负情况", "MVP", "备注", "本方阵营"]
+                        "游走选手", "胜负情况", "MVP", "本方阵营"]
         display_cols = [c for c in display_cols if c in df.columns]
         st.session_state.result_df = df
         st.session_state.display_cols = display_cols
