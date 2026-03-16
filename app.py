@@ -9,8 +9,11 @@ SPG战队赛数据中心 v3.0
 """
 
 import base64
+import hashlib
+import html
 import json
 import os
+import random
 import re
 import subprocess
 import tempfile
@@ -315,6 +318,43 @@ def get_mime(name: str) -> str:
     return {".jpg": "image/jpeg", ".jpeg": "image/jpeg",
             ".png": "image/png", ".webp": "image/webp"}.get(ext, "image/png")
 
+
+def render_dblclick_image_preview(img_bytes: bytes, mime: str, caption: str) -> None:
+    """显示可双击打开原图的缩略图预览。"""
+    preview_bytes = img_bytes
+    preview_mime = mime
+    try:
+        arr = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None and img.shape[1] > 420:
+            h, w = img.shape[:2]
+            scale = 420 / w
+            thumb = cv2.resize(img, (420, int(h * scale)), interpolation=cv2.INTER_AREA)
+            ok, buf = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 78])
+            if ok:
+                preview_bytes = buf.tobytes()
+                preview_mime = "image/jpeg"
+    except Exception:
+        pass
+
+    preview_b64 = encode_bytes_b64(preview_bytes)
+    full_b64 = encode_bytes_b64(img_bytes)
+    safe_caption = html.escape(caption or "")
+    st.markdown(
+        f"""
+        <div style="text-align:center;">
+          <img
+            src="data:{preview_mime};base64,{preview_b64}"
+            style="width:100%;max-width:420px;border-radius:10px;cursor:zoom-in;"
+            title="双击打开原图"
+            ondblclick="window.open('data:{mime};base64,{full_b64}','_blank')"
+          />
+          <div style="font-size:12px;color:#666;margin-top:6px;">{safe_caption}<br/>（双击图片打开原图）</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 def parse_json_robust(raw: str) -> dict:
     for fn in [
         lambda t: json.loads(t),
@@ -504,6 +544,8 @@ def frame_to_png_bytes(frame: np.ndarray) -> bytes:
 MAX_IMG_WIDTH = 1280
 JPEG_QUALITY = 85
 MAX_DIRECT_BYTES = 1_500_000  # 约 1.5MB，超过则尝试再压缩
+TARGET_COMPRESSED_BYTES = 800_000  # 压缩目标：约 800KB
+MIN_JPEG_QUALITY = 70
 
 
 def _compress_image_for_api(img_bytes: bytes, mime: str) -> tuple[bytes, str]:
@@ -524,9 +566,18 @@ def _compress_image_for_api(img_bytes: bytes, mime: str) -> tuple[bytes, str]:
         if w <= MAX_IMG_WIDTH and len(img_bytes) <= MAX_DIRECT_BYTES:
             return img_bytes, mime
 
-        ok, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        quality = JPEG_QUALITY
+        ok, buf = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if ok:
-            return buf.tobytes(), "image/jpeg"
+            out = buf.tobytes()
+            # 体积兜底：继续降质到目标大小，避免移动端慢网卡顿
+            while len(out) > TARGET_COMPRESSED_BYTES and quality > MIN_JPEG_QUALITY:
+                quality -= 5
+                ok2, buf2 = cv2.imencode(".jpg", resized, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                if not ok2:
+                    break
+                out = buf2.tobytes()
+            return out, "image/jpeg"
     except Exception:
         pass
     return img_bytes, mime
@@ -637,7 +688,7 @@ def call_vision_qwen(img_bytes: bytes, mime: str, api_key: str) -> dict:
 
 
 def call_vision_qwen_with_retry(img_bytes: bytes, mime: str, api_key: str,
-                                 max_retries: int = 3) -> dict:
+                                 max_retries: int = 2) -> dict:
     """带自动重试的 Qwen-VL-Max 调用（处理限流等临时错误）。"""
     last_err = None
     for attempt in range(max_retries):
@@ -647,7 +698,8 @@ def call_vision_qwen_with_retry(img_bytes: bytes, mime: str, api_key: str,
             last_err = e
             err_str = str(e).lower()
             if "throttl" in err_str or "rate" in err_str or "429" in str(e) or "limit" in err_str:
-                wait = 10 * (attempt + 1)
+                # 429/限流：指数退避 + 抖动
+                wait = (1.5 * (2 ** attempt)) + random.uniform(0.0, 0.4)
                 _time.sleep(wait)
                 continue
             else:
@@ -756,6 +808,27 @@ def _normalize_for_match(s: str) -> str:
     return s.strip()
 
 
+def _clean_gid_candidate(s: str) -> str:
+    """
+    清理 AI/OCR 可能混入的前缀噪声，避免把“金鹰游走：xxx”“MVP:xxx 13.1”误当成人名。
+    """
+    s = str(s or "").strip()
+    if not s:
+        return ""
+
+    # 去掉末尾可能混入的评分
+    s = re.sub(r"\s+\d{1,2}(?:\.\d+)?$", "", s).strip()
+
+    # 形如「金鹰游走：用心喜欢你」「MVP:某某」→ 取冒号右侧
+    if "：" in s or ":" in s:
+        left, right = re.split(r"[：:]", s, maxsplit=1)
+        left = left.strip()
+        if any(k in left for k in ("对抗路", "中路", "发育路", "打野", "游走", "辅助", "MVP", "顶级", "金牌", "银牌", "铜牌", "金鹰")):
+            s = right.strip()
+
+    return s.strip()
+
+
 def match_id(gid: str, id2n: dict, ids: list, thr: int = 60) -> str:
     """
     将游戏ID模糊匹配为战队成员真名。
@@ -763,7 +836,9 @@ def match_id(gid: str, id2n: dict, ids: list, thr: int = 60) -> str:
     """
     if not gid or not gid.strip():
         return ""
-    gid = gid.strip()
+    gid = _clean_gid_candidate(gid)
+    if not gid:
+        return ""
     if _is_hero_name(gid):
         return ""
     # 1. 精确匹配
@@ -817,7 +892,10 @@ def _count_roster_matches(players: list, id2n: dict, ids: list, thr: int) -> int
     known_names = set(id2n.values())
     count = 0
     for p in players[:5]:
-        gid = (p.get("游戏ID") or p) if isinstance(p, dict) else str(p)
+        if isinstance(p, dict):
+            gid = str(p.get("游戏ID", "")).strip()
+        else:
+            gid = str(p).strip()
         if not gid:
             continue
         matched = match_id(gid, id2n, ids, thr)
@@ -838,9 +916,10 @@ def _pick_our_side(left: dict, right: dict, id2n: dict, ids: list, thr: int, top
         return right
 
     # 平票：优先选择比赛结果与顶部大字一致的一侧
-    if top_result in ("胜利", "失败"):
-        left_res = str(left.get("比赛结果") or "").strip()
-        right_res = str(right.get("比赛结果") or "").strip()
+    top_result = _normalize_result_text(top_result)
+    if top_result in (RESULT_WIN, RESULT_LOSE):
+        left_res = _normalize_result_text(left.get("比赛结果"))
+        right_res = _normalize_result_text(right.get("比赛结果"))
         if left_res == top_result and right_res != top_result:
             return left
         if right_res == top_result and left_res != top_result:
@@ -848,6 +927,26 @@ def _pick_our_side(left: dict, right: dict, id2n: dict, ids: list, thr: int, top
 
     # 仍无法区分时兜底左侧
     return left
+
+
+RESULT_WIN = "\u80dc\u5229"
+RESULT_LOSE = "\u5931\u8d25"
+RESULT_UNKNOWN = "\u672a\u77e5"
+
+
+def _normalize_result_text(v) -> str:
+    """将胜负文本统一为 胜利/失败/未知。"""
+    s = str(v or "").strip()
+    if not s:
+        return RESULT_UNKNOWN
+    if s in (RESULT_WIN, RESULT_LOSE):
+        return s
+    lower = s.lower()
+    if any(k in lower for k in ("win", "victory", "won")):
+        return RESULT_WIN
+    if any(k in lower for k in ("lose", "loss", "defeat", "lost")):
+        return RESULT_LOSE
+    return s
 
 
 def result_to_row(res: dict, id2n: dict, ids: list, thr: int, src: str) -> dict | None:
@@ -865,17 +964,17 @@ def result_to_row(res: dict, id2n: dict, ids: list, thr: int, src: str) -> dict 
         players = side.get("选手") or []
         camp = side.get("阵营") or "未知"
         # 顶部显示的胜利/失败为最终权威，优先使用
-        result = (res.get("顶部显示") or side.get("比赛结果") or "未知").strip()
-        if result not in ("胜利", "失败"):
-            result = side.get("比赛结果") or "未知"
+        result = _normalize_result_text(res.get("顶部显示") or side.get("比赛结果") or "未知")
+        if result not in (RESULT_WIN, RESULT_LOSE):
+            result = _normalize_result_text(side.get("比赛结果") or "未知")
         mvp_raw = side.get("MVP")
     else:
         # 兼容旧格式：直接返回 选手
         players = res.get("选手") or res.get("我方队员") or []
         camp = res.get("本方阵营") or "未知"
-        result = (res.get("顶部显示") or res.get("比赛结果") or "未知").strip()
-        if result not in ("胜利", "失败"):
-            result = res.get("比赛结果", "未知")
+        result = _normalize_result_text(res.get("顶部显示") or res.get("比赛结果") or "未知")
+        if result not in (RESULT_WIN, RESULT_LOSE):
+            result = _normalize_result_text(res.get("比赛结果", "未知"))
         mvp_raw = res.get("MVP")
 
     # 兼容旧格式（纯 ID 列表）
@@ -962,13 +1061,62 @@ def result_to_row(res: dict, id2n: dict, ids: list, thr: int, src: str) -> dict 
 
 
 def df_to_excel(df: pd.DataFrame) -> bytes:
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         df.to_excel(w, index=False, sheet_name="战队赛统计")
         ws = w.sheets["战队赛统计"]
+
+        # 统一列宽
         for ci, col in enumerate(df.columns, 1):
             ml = max(df[col].astype(str).map(len).max(), len(col))
             ws.column_dimensions[ws.cell(1, ci).column_letter].width = min(ml * 2 + 4, 40)
+
+        # 视觉风格：接近腾讯文档记录表
+        header_fill = PatternFill("solid", fgColor="F3F5F8")
+        lane_fill = PatternFill("solid", fgColor="FFF4CC")
+        win_fill = PatternFill("solid", fgColor="4CAF50")
+        lose_fill = PatternFill("solid", fgColor="E57373")
+        thin_border = Border(
+            left=Side(style="thin", color="E5E7EB"),
+            right=Side(style="thin", color="E5E7EB"),
+            top=Side(style="thin", color="E5E7EB"),
+            bottom=Side(style="thin", color="E5E7EB"),
+        )
+
+        # 表头样式
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = Font(bold=True, color="374151")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+
+        lane_like_cols = {"对抗路选手", "打野选手", "中路选手", "发育路选手", "游走选手", "MVP"}
+        result_col = "胜负情况" if "胜负情况" in df.columns else "比赛结果"
+
+        # 数据行样式
+        for ri in range(2, ws.max_row + 1):
+            for ci, col in enumerate(df.columns, 1):
+                cell = ws.cell(ri, ci)
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = thin_border
+
+                if col in lane_like_cols:
+                    cell.fill = lane_fill
+                if col == result_col:
+                    v = str(cell.value or "").strip()
+                    if v == "胜利":
+                        cell.fill = win_fill
+                        cell.font = Font(color="FFFFFF", bold=True)
+                    elif v == "失败":
+                        cell.fill = lose_fill
+                        cell.font = Font(color="FFFFFF", bold=True)
+
+        # 体验优化：冻结表头 + 自动筛选
+        ws.freeze_panes = "A2"
+        ws.auto_filter.ref = ws.dimensions
+
     return buf.getvalue()
 
 
@@ -1077,7 +1225,6 @@ def main():
         st.caption("若未部署，请将本仓库导入 [Streamlit Cloud](https://share.streamlit.io) 获取页面网址")
 
     # ──────── Hero Banner ────────
-    streamlit_app_url = "https://spg-data-center-zzzzzzeus496.streamlit.app"
     st.markdown(f"""
     <div class="hero-banner">
         <h1>SPG 战队赛 · 数据中心</h1>
@@ -1089,9 +1236,6 @@ def main():
             <span class="flow-arrow">→</span>
             <div class="flow-step"><span class="n">3</span>一键导出</div>
         </div>
-        <p class="sub" style="margin-top:16px; font-size:0.85rem;">
-            🌐 应用页面：<a href="{streamlit_app_url}" target="_blank" style="color:#ffd700;">{streamlit_app_url}</a>
-        </p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1103,84 +1247,98 @@ def main():
         accept_multiple_files=True,
     )
 
-    if not uploaded:
-        st.markdown("""
-        <div class="empty-state">
-            <div class="icon">📸  🎬</div>
-            <p class="main-text">将结算截图或比赛录屏拖拽到上方</p>
-            <p class="sub-text">支持 JPG · PNG · MP4 · MOV 格式，可一次上传多个文件</p>
-        </div>
-        """, unsafe_allow_html=True)
-        return
+    if "upload_signature" not in st.session_state:
+        st.session_state.upload_signature = None
+    if "analysis_payload" not in st.session_state:
+        st.session_state.analysis_payload = None
 
-    # ── 分类文件 ──
+    # ── 分类并缓存素材（支持再次分析，无需刷新重传） ──
     IMG_EXT = {".jpg", ".jpeg", ".png", ".webp"}
     VID_EXT = {".mp4", ".mov", ".avi"}
-    imgs, vids = [], []
-    for f in uploaded:
-        ext = Path(f.name).suffix.lower()
-        if ext in IMG_EXT:
-            imgs.append(f)
-        elif ext in VID_EXT:
-            vids.append(f)
+    img_items: list[tuple[bytes, str, str]] = []  # (bytes, mime, name)
+    auto_frames: list[tuple[bytes, str]] = []     # (png_bytes, name)
+    needs_rebuild = False
 
-    # ── 自动处理视频 → 提取结算帧 ──
-    auto_frames: list[tuple[bytes, str]] = []
-    if vids:
-        st.markdown("---")
-        for vf in vids:
-            st.markdown(f"**🎬 处理视频：{vf.name}**")
-            prog_extract = st.progress(0, text=f"正在从 {vf.name} 抽取画面帧...")
-            raw_frames = extract_video_frames(vf.getvalue(), max_frames=max_frames)
-            prog_extract.progress(0.5, text=f"已抽取 {len(raw_frames)} 帧，正在智能筛选结算画面...")
+    if uploaded:
+        raw_items = []
+        for f in uploaded:
+            b = f.getvalue()
+            raw_items.append((f.name, Path(f.name).suffix.lower(), b, get_mime(f.name)))
+        sig = tuple((name, len(b), hashlib.sha1(b).hexdigest()) for name, _, b, _ in raw_items)
+        needs_rebuild = sig != st.session_state.upload_signature
+        if needs_rebuild:
+            st.session_state.upload_signature = sig
 
-            settlement = filter_settlement_frames(raw_frames)
-            prog_extract.progress(1.0,
-                text=f"✅ {vf.name}：抽取 {len(raw_frames)} 帧 → 识别到 {len(settlement)} 个结算画面")
+            vids = [(name, b) for name, ext, b, _ in raw_items if ext in VID_EXT]
+            img_items = [(b, mime, name) for name, ext, b, mime in raw_items if ext in IMG_EXT]
+            auto_frames = []
 
-            if settlement:
-                # 小尺寸预览
-                prev_cols = st.columns(min(len(settlement), 6))
-                for i, frame in enumerate(settlement[:6]):
-                    with prev_cols[i]:
-                        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        st.image(rgb, caption=f"结算 #{i+1}", use_container_width=True)
-                if len(settlement) > 6:
-                    st.caption(f"... 共 {len(settlement)} 个结算画面")
+            if vids:
+                st.markdown("---")
+                for vname, vb in vids:
+                    st.markdown(f"**🎬 处理视频：{vname}**")
+                    prog_extract = st.progress(0, text=f"正在从 {vname} 抽取画面帧...")
+                    raw_frames = extract_video_frames(vb, max_frames=max_frames)
+                    prog_extract.progress(0.5, text=f"已抽取 {len(raw_frames)} 帧，正在智能筛选结算画面...")
 
-                for i, frame in enumerate(settlement):
-                    auto_frames.append(
-                        (frame_to_png_bytes(frame), f"{vf.name}·结算{i+1}"))
-            else:
-                st.warning(f"⚠️ 未在 {vf.name} 中检测到结算画面，请确认视频内容")
+                    settlement = filter_settlement_frames(raw_frames)
+                    prog_extract.progress(
+                        1.0,
+                        text=f"✅ {vname}：抽取 {len(raw_frames)} 帧 → 识别到 {len(settlement)} 个结算画面",
+                    )
+
+                    if settlement:
+                        prev_cols = st.columns(min(len(settlement), 6))
+                        for i, frame in enumerate(settlement[:6]):
+                            with prev_cols[i]:
+                                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                st.image(rgb, caption=f"结算 #{i+1}", use_container_width=True)
+                        if len(settlement) > 6:
+                            st.caption(f"... 共 {len(settlement)} 个结算画面")
+
+                        for i, frame in enumerate(settlement):
+                            auto_frames.append((frame_to_png_bytes(frame), f"{vname}·结算{i+1}"))
+                    else:
+                        st.warning(f"⚠️ 未在 {vname} 中检测到结算画面，请确认视频内容")
+
+            st.session_state.analysis_payload = {
+                "img_items": img_items,
+                "auto_frames": auto_frames,
+            }
+        else:
+            payload = st.session_state.analysis_payload or {}
+            img_items = payload.get("img_items", [])
+            auto_frames = payload.get("auto_frames", [])
+    else:
+        payload = st.session_state.analysis_payload or {}
+        img_items = payload.get("img_items", [])
+        auto_frames = payload.get("auto_frames", [])
+        if not img_items and not auto_frames:
+            st.markdown("""
+            <div class="empty-state">
+                <div class="icon">📸  🎬</div>
+                <p class="main-text">将结算截图或比赛录屏拖拽到上方</p>
+                <p class="sub-text">支持 JPG · PNG · MP4 · MOV 格式，可一次上传多个文件</p>
+            </div>
+            """, unsafe_allow_html=True)
+            return
+        st.info("已保留上次上传素材：你可以直接再次分析，无需刷新或重新上传。")
 
     # ── 图片预览（缩略图，减轻手机端渲染） ──
-    if imgs:
+    if img_items:
         st.markdown("---")
-        st.markdown(f"**🖼️ 已上传 {len(imgs)} 张截图**")
-        n_show = min(len(imgs), 4)
+        st.markdown(f"**🖼️ 已上传 {len(img_items)} 张截图**")
+        n_show = min(len(img_items), 4)
         cols = st.columns(n_show)
         for i in range(n_show):
             with cols[i]:
-                try:
-                    b = imgs[i].getvalue()
-                    arr = np.frombuffer(b, np.uint8)
-                    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-                    if img is not None and img.shape[1] > 400:
-                        h, w = img.shape[:2]
-                        scale = 400 / w
-                        thumb = cv2.resize(img, (400, int(h * scale)), interpolation=cv2.INTER_AREA)
-                        thumb_rgb = cv2.cvtColor(thumb, cv2.COLOR_BGR2RGB)
-                        st.image(thumb_rgb, caption=imgs[i].name, use_container_width=True)
-                    else:
-                        st.image(imgs[i], caption=imgs[i].name, use_container_width=True)
-                except Exception:
-                    st.image(imgs[i], caption=imgs[i].name, use_container_width=True)
-        if len(imgs) > 4:
-            st.caption(f"... 还有 {len(imgs) - 4} 张")
+                b, mime, name = img_items[i]
+                render_dblclick_image_preview(b, mime, name)
+        if len(img_items) > 4:
+            st.caption(f"... 还有 {len(img_items) - 4} 张")
 
     # ── 开始分析 ──
-    total_count = len(imgs) + len(auto_frames)
+    total_count = len(img_items) + len(auto_frames)
     st.markdown("---")
 
     if total_count == 0:
@@ -1194,11 +1352,30 @@ def main():
     _, btn_col, _ = st.columns([1, 2, 1])
     with btn_col:
         engine_label = "Qwen-VL-Max"
-        go = st.button(f"🚀 开始 {engine_label} 分析（共 {total_count} 张结算画面）",
-                       type="primary", disabled=not can_go, use_container_width=True)
+        go = st.button(
+            f"🚀 开始 {engine_label} 分析（共 {total_count} 张结算画面）",
+            type="primary",
+            disabled=not can_go,
+            use_container_width=True,
+        )
+        re_go = st.button(
+            "🔁 微调后再次分析（沿用当前素材）",
+            disabled=not can_go,
+            use_container_width=True,
+        )
 
-    if go:
-        do_analysis(imgs, auto_frames, api_key, id2n, all_ids, threshold, engine_id)
+    clear_col_l, clear_col_m, clear_col_r = st.columns([1, 2, 1])
+    with clear_col_m:
+        clear_payload = st.button("🧹 清空当前素材与结果", use_container_width=True)
+    if clear_payload:
+        st.session_state.analysis_payload = None
+        st.session_state.upload_signature = None
+        st.session_state.result_df = None
+        st.session_state.display_cols = None
+        st.rerun()
+
+    if go or re_go:
+        do_analysis(img_items, auto_frames, api_key, id2n, all_ids, threshold, engine_id)
 
     if "result_df" in st.session_state and st.session_state.result_df is not None:
         show_report(st.session_state.result_df)
@@ -1211,7 +1388,11 @@ def main():
 def do_analysis(imgs, auto_frames, api_key, id2n, all_ids, thr, engine="qwen"):
     tasks = []
     for f in imgs:
-        tasks.append((f.getvalue(), get_mime(f.name), f.name))
+        if isinstance(f, tuple) and len(f) == 3:
+            bts, mime, name = f
+        else:
+            bts, mime, name = f.getvalue(), get_mime(f.name), f.name
+        tasks.append((bts, mime, name))
     for png_bytes, name in auto_frames:
         tasks.append((png_bytes, "image/png", name))
 
@@ -1220,8 +1401,10 @@ def do_analysis(imgs, auto_frames, api_key, id2n, all_ids, thr, engine="qwen"):
     engine_label = "Qwen-VL-Max"
     prog = st.progress(0, text=f"🤖 {engine_label} 正在并发分析 {total} 个结算画面...")
 
-    # ── 并发分析：最多 8 路并行，加速处理 ──
-    MAX_WORKERS = min(8, total)
+    # ── 动态并发分析：根据错误率自动调节并发（更快且更稳） ──
+    max_workers = min(10, total)
+    min_workers = 1 if total < 3 else 3
+    current_workers = min(6, max_workers)
     completed_count = 0
     # 用字典保持原始顺序
     results_map = {}  # idx -> (row, error)
@@ -1239,19 +1422,35 @@ def do_analysis(imgs, auto_frames, api_key, id2n, all_ids, thr, engine="qwen"):
         except Exception as e:
             return idx, None, f"{name}：{e}"
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(_analyze_one, i, bts, mime, name): i
-            for i, (bts, mime, name) in enumerate(tasks)
-        }
-        for future in as_completed(futures):
-            completed_count += 1
-            prog.progress(
-                completed_count / total,
-                text=f"🤖 {engine_label} 并发分析中... ({completed_count}/{total})"
-            )
-            idx, row, err = future.result()
-            results_map[idx] = (row, err)
+    pending = list(enumerate(tasks))
+    while pending:
+        batch = pending[:current_workers]
+        pending = pending[current_workers:]
+        batch_errors = 0
+        with ThreadPoolExecutor(max_workers=current_workers) as executor:
+            futures = {
+                executor.submit(_analyze_one, i, bts, mime, name): i
+                for i, (bts, mime, name) in batch
+            }
+            for future in as_completed(futures):
+                completed_count += 1
+                prog.progress(
+                    completed_count / total,
+                    text=f"🤖 {engine_label} 并发分析中... ({completed_count}/{total}) · 并发{current_workers}"
+                )
+                idx, row, err = future.result()
+                results_map[idx] = (row, err)
+                if err:
+                    batch_errors += 1
+
+        # 按批次错误率调节并发：错误高就降，稳定就升
+        err_rate = batch_errors / max(1, len(batch))
+        if err_rate > 0.35:
+            current_workers = max(min_workers, current_workers - 2)
+        elif err_rate > 0.15:
+            current_workers = max(min_workers, current_workers - 1)
+        elif err_rate == 0 and current_workers < max_workers:
+            current_workers += 1
 
     # 按原始顺序收集结果
     for idx in sorted(results_map.keys()):
@@ -1270,9 +1469,9 @@ def do_analysis(imgs, auto_frames, api_key, id2n, all_ids, thr, engine="qwen"):
 
     if rows:
         df = pd.DataFrame(rows)
-        # 显示列（腾讯文档格式）
-        display_cols = ["日期", "本方阵营", "对抗路选手", "中路选手", "发育路选手",
-                        "打野选手", "游走选手", "胜负情况", "MVP", "备注"]
+        # 显示列（贴近你提供的记录表顺序）
+        display_cols = ["日期", "对抗路选手", "打野选手", "中路选手", "发育路选手",
+                        "游走选手", "胜负情况", "MVP", "备注", "本方阵营"]
         display_cols = [c for c in display_cols if c in df.columns]
         st.session_state.result_df = df
         st.session_state.display_cols = display_cols
@@ -1365,6 +1564,16 @@ def show_report(df: pd.DataFrame):
             return "background-color: rgba(205,127,50,0.22); color:#6a3b15; font-weight:700"
         return ""
 
+    def style_podium_row(row):
+        idx = row.name
+        if idx == 1:
+            return ["background-color: rgba(255,215,0,0.25); font-weight:900"] * len(row)
+        if idx == 2:
+            return ["background-color: rgba(192,192,192,0.20); font-weight:700"] * len(row)
+        if idx == 3:
+            return ["background-color: rgba(205,127,50,0.15); font-weight:600"] * len(row)
+        return [""] * len(row)
+
     styled = show_df.style
 
     if result_col in show_df.columns:
@@ -1377,22 +1586,26 @@ def show_report(df: pd.DataFrame):
     if "备注" in show_df.columns:
         styled = styled.map(style_medal_col, subset=["备注"])
 
+    lane_like_cols = [c for c in ["对抗路选手", "打野选手", "中路选手", "发育路选手", "游走选手", "MVP"] if c in show_df.columns]
+    if lane_like_cols:
+        styled = styled.set_properties(subset=lane_like_cols, **{"background-color": "#fff4cc"})
+
     styled = (
         styled
         .set_properties(**{"text-align": "center"})
         .set_table_styles([
             {"selector": "thead th", "props": [
-                ("background-color", "#1a1a2e"), ("color", "#ffd700"),
+                ("background-color", "#f3f5f8"), ("color", "#374151"),
                 ("font-weight", "700"), ("text-align", "center"),
-                ("padding", "12px 14px"), ("font-size", "0.9rem"),
-                ("border-bottom", "2px solid rgba(255,215,0,0.3)"),
+                ("padding", "11px 12px"), ("font-size", "0.9rem"),
+                ("border-bottom", "1px solid #e5e7eb"),
             ]},
             {"selector": "tbody tr:nth-child(even)", "props": [
-                ("background-color", "#f8f8fc")]},
-            {"selector": "tbody tr:nth-child(odd)", "props": [
                 ("background-color", "#ffffff")]},
+            {"selector": "tbody tr:nth-child(odd)", "props": [
+                ("background-color", "#fcfcfd")]},
             {"selector": "tbody td", "props": [
-                ("padding", "10px 12px"), ("font-size", "0.88rem")]},
+                ("padding", "9px 10px"), ("font-size", "0.88rem"), ("border-bottom", "1px solid #f0f2f5")]},
         ])
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
@@ -1417,19 +1630,9 @@ def show_report(df: pd.DataFrame):
             win_rank.index = range(1, len(win_rank) + 1)
             win_rank.index.name = "排名"
 
-            def style_win_rank(row):
-                idx = row.name
-                if idx == 1:
-                    return ["background-color: rgba(255,215,0,0.25); font-weight:900"] * len(row)
-                if idx == 2:
-                    return ["background-color: rgba(192,192,192,0.20); font-weight:700"] * len(row)
-                if idx == 3:
-                    return ["background-color: rgba(205,127,50,0.15); font-weight:600"] * len(row)
-                return [""] * len(row)
-
             win_styled = (
                 win_rank.style
-                .apply(style_win_rank, axis=1)
+                .apply(style_podium_row, axis=1)
                 .set_properties(**{"text-align": "center"})
                 .set_table_styles([
                     {"selector": "thead th", "props": [
@@ -1460,20 +1663,9 @@ def show_report(df: pd.DataFrame):
             ranking.index = range(1, len(ranking) + 1)
             ranking.index.name = "排名"
 
-            # 标注前三名
-            def style_rank(row):
-                idx = row.name
-                if idx == 1:
-                    return ["background-color: rgba(255,215,0,0.25); font-weight:900"] * len(row)
-                if idx == 2:
-                    return ["background-color: rgba(192,192,192,0.20); font-weight:700"] * len(row)
-                if idx == 3:
-                    return ["background-color: rgba(205,127,50,0.15); font-weight:600"] * len(row)
-                return [""] * len(row)
-
             rank_styled = (
                 ranking.style
-                .apply(style_rank, axis=1)
+                .apply(style_podium_row, axis=1)
                 .set_properties(**{"text-align": "center"})
                 .set_table_styles([
                     {"selector": "thead th", "props": [
@@ -1516,7 +1708,18 @@ def show_report(df: pd.DataFrame):
             medal_df = medal_df.sort_values(["顶级", "金牌", "银牌", "铜牌", "总奖牌"], ascending=False).reset_index(drop=True)
             medal_df.index = range(1, len(medal_df) + 1)
             medal_df.index.name = "排名"
-            st.dataframe(medal_df, use_container_width=True)
+            medal_styled = (
+                medal_df.style
+                .apply(style_podium_row, axis=1)
+                .set_properties(**{"text-align": "center"})
+                .set_table_styles([
+                    {"selector": "thead th", "props": [
+                        ("background-color", "#1a1a2e"), ("color", "#ffd700"),
+                        ("font-weight", "700"), ("text-align", "center"), ("padding", "10px"),
+                    ]},
+                ])
+            )
+            st.dataframe(medal_styled, use_container_width=True)
 
     # ── 下载 ──
     st.markdown("---")
